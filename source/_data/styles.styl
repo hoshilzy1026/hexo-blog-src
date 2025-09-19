@@ -1,0 +1,29 @@
+body {
+      background: url(/images/background.png);
+      background-size: 100% 100%;
+      background-repeat: no-repeat;
+      background-attachment: fixed;
+      background-position: 50% 50%;
+	opacity: 0.85;
+    //可选
+    +mobile(){
+      background-image: url(https://ziyuan.lruihao.cn/images/bg_cell.png);
+      background-size: cover;
+    }
+}
+.post-block {
+  opacity: 0.9;
+}
+//侧边框的透明度设置
+.sidebar {
+  background-color: transparent;
+  opacity: 0.7;
+}
+//菜单栏的透明度设置
+.header-inner {
+  background: rgba(255,255,255,0.7);
+}
+//搜索框（local-search）的透明度设置
+.popup {
+  opacity: 0.7;
+}
