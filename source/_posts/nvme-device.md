@@ -5,14 +5,22 @@ tags:
   - nvme
   - Crimson
 ---
-现在的存储速度，传统 SATA SSD 已经跟不上了。于是 NVMe 出场了——更快、更并行、延迟低。Ceph 的 Crimson 正是为了迎接这样的下一代存储而生，它用 Seastar 来管理这些 NVMe 设备，把每个设备、每个队列都当作可调度的资源，让多核 CPU 的性能被充分发挥。今天，我们就从 NVMe 设备聊起，顺着 Crimson 的设备管理一路看下去，看看底层到底是怎么跑的。
+NVMe 的问世，把存储硬件的性能拉到了 **“微秒 + 百万 IOPS”** 的时代。传统的内核 IO 栈和同步编程模式，反而成了新的瓶颈，无法充分释放硬件潜力。这迫使软件必须进行一次深刻的变革：从 **同步 → 异步**，从 **内核 → 用户态**，从 **粗粒度锁 → 精细化无锁并发**，才能真正发挥出 NVMe 的极限性能。
+
+在 Ceph 的设想中，未来的存储引擎 **SeaStore** 正是为了承担这一使命：
+
+- **同步到异步**：完全基于 Seastar 框架，采用 Future/Promise 异步编程模型，杜绝阻塞。
+- **内核到用户态**：借助 Seastar 的用户态网络dpdk与 io_uring 用户态 IO 接口，最大程度减少内核切换开销。
+- **绑核与分片**：每个 CPU shard 独立运行，线程与数据强绑定，端到端的数据路径天然无锁。
+- **无锁化**：通过分片隔离与消息传递机制，避免传统锁竞争，让并发更细粒度、更高效。
+
+这样一来，SeaStore 不仅是 Ceph 的“下一代引擎”，更是面向 NVMe 时代的软件范式转型的具体落地。
 
 <!-- more -->
+
 ## 什么是NVMe
 
-NVMe是协议，不是设备也不是驱动，就像HTTP是协议，浏览器和服务器是实现，NVMe 定义了SSD和主机控制器之间如何交流。
-
-NVMe设计的初衷是针对**非易失性存储介质（NAND、3D XPoint、持久内存等）** 设计。
+NVMe是协议，不是设备也不是驱动，就像HTTP是协议，浏览器和服务器是实现，NVMe 定义了SSD和主机控制器之间如何交流。可减少[闪存存储](https://www.ibm.com/cn-zh/topics/flash-storage)和[固态硬盘 (SSD) ]中使用的每个输入/输出 (I/O) 的系统开销。
 
 不再兼容HDD时代的AHCI设计限制（单队列、深度32）
 
@@ -52,6 +60,48 @@ NVMe设计的初衷是针对**非易失性存储介质（NAND、3D XPoint、持�
 
   + PCIe 提供物理链路
   + NVMe协议再PCIe之上定义逻辑指令集
+
+## 为什么传统软件栈不够用？
+
+虽然 Bluestore 已经绕过了文件系统（直接管理裸盘），但它仍然存在两个关键瓶颈：
+
+1. **依赖内核 IO 栈**  
+   - Bluestore 使用 libaio 提交请求，最终还是要走 Linux 内核的 I/O 路径。  
+   - NVMe 的多队列并行性被内核锁与调度部分抵消。  
+
+2. **多核扩展差**  
+   - 传统ceph的OSD 内部有大量线程，多个线程共享一个设备队列，需要加锁。  
+   - NVMe 给了“每个 core 一个队列”的能力，但传统 OSD 架构无法做到真正的无锁扩展。  
+
+结果就是：  
+- NVMe 单盘明明能跑 100 万 IOPS，Bluestore OSD 只能吃下 20~30 万。  
+- 延迟也比硬件指标多出几倍。  
+
+这就是 Ceph 需要 Crimson/Seastore 的根本原因。
+
+---
+
+## Seastar 与 NVMe 的天然契合
+
+NVMe 的设计理念，和 Seastar 的 shard 模型几乎是天然匹配的：  
+
+- **多队列对多 shard**  
+  - NVMe：最多 64K 个提交/完成队列，每个 core 可独享一个队列。  
+  - Seastar：应用拆分成多个 shard，每个 core 独立执行。  
+  - 映射关系：一个 shard ↔ 一个 NVMe 队列，无需锁。  
+
+- **无锁并行**  
+  - 每个 core 只 poll 自己的完成队列，不会和其他 core 争抢。  
+  - I/O 提交和完成完全 core-local，避免了传统 OSD 的“队列共享 + 自旋锁”。  
+
+- **性能收益直观**  
+  - 传统 aio + 内核队列：单盘 4KB 随机读 ~40 万 IOPS  
+  - io_uring + shard 绑定队列：单盘可跑 150 万 IOPS+  
+  - 在 Crimson/Seastore 的实验结果中，相比 Bluestore 延迟下降 3~5 倍，IOPS 提升 2~3 倍。  
+
+可以说，Seastore 不是“适配 NVMe”，而是“为 NVMe 而生”。
+
+---
 
 ## **设备特性**
 
@@ -96,59 +146,5 @@ NVMe设计的初衷是针对**非易失性存储介质（NAND、3D XPoint、持�
   + 端到端保护
   + 持Secure Boot、Firmware安全校验、Format、 Sanitize等多种企业级安全特性
 
-
-
-简单了解了NVMe 协议和设备的特性，
-
-## 2️⃣ 软件工程层（开发 Crimson/Seastore 必须掌握）
-
-- **I/O 路径**
-  - 内核 NVMe 驱动怎么和 `io_uring` 打通。
-  - 为什么用户态驱动（SPDK）能进一步降低延迟。
-  - O_DIRECT、DMA 映射对性能的影响。
-- **多核并行**
-  - NVMe 支持多队列，你的软件要怎么分配（比如 Seastar shard 对应 NVMe queue pair）。
-  - 如何避免多个 core 抢一个 queue 带来的锁竞争。
-- **错误处理**
-  - `EINVAL (Invalid argument)`：未对齐 I/O。
-  - `EIO`：设备层报错，需要 retry。
-  - reset / requeue 的语义（设备热插拔时必须考虑）。
-- **性能优化**
-  - 顺序写 > 随机写，如何利用 append-log 结构减少随机写。
-  - 大块 I/O（128K、1M）和小块 I/O 的 trade-off。
-  - IOPS vs 吞吐量的权衡。
-
-## 3️⃣ 深入机制层（进阶，写存储引擎/GC/调度必须掌握）
-
-- **Flash 物理特性**
-  - Page / Block / Plane 的层次结构。
-  - 为什么必须“先擦后写”。
-  - 写放大（WA）和 GC 的触发机制。
-  - 耐久性（DWPD：Drive Writes Per Day）。
-- **NVMe 协议细节**
-  - NVMe 命令集（Read, Write, Flush, Dataset Management, Zone Append）。
-  - Zoned Namespace (ZNS) SSD 的新模式（只能顺序写 Zone）。
-  - NVMe 2.0 里的 KV SSD 扩展（key-value 命令）。
-- **持久性保证**
-  - Flush/FUA 的语义（写入必须持久化到 NAND）。
-  - Ceph Crimson 里 journal write + flush 的正确用法。
-  - Power-loss protection（掉电保护）的区别。
-
-## 4️⃣ 前沿与趋势层（存储软件研发 leader 需要了解）
-
-- **SPDK / DPDK + NVMe-oF**
-  - 用户态驱动模型，绕过内核栈。
-  - 远程存储：NVMe over Fabrics（RoCE、TCP）。
-- **ZNS SSD 与软件定义存储**
-  - 用软件控制写放大和 GC，替代 FTL（Flash Translation Layer）。
-- **CXL 与持久内存**
-  - NVMe 未来可能和 CXL 竞争/融合。
-
-## 为什么要关注设备管理？
-
-## Crimson 的设备抽象？
-
-## 设备初始化流程？
-
-## 关键问题？
+___
 
