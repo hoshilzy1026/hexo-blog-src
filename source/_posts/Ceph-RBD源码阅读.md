@@ -3,9 +3,9 @@ layout: ceph-rbd
 title: Ceph-RBD源码阅读  
 date: 2025-10-13 18:03:00
 tags:
-  -ceph
-  -存储	
-  -分布式
+  - ceph
+  - 存储	
+  - 分布式
 ---
 
 + RBD 是 Ceph 分布式存储系统中提供的块存储服务
